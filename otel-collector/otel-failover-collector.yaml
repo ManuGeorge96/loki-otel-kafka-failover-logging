@@ -1,0 +1,217 @@
+# OpenTelemetry Collector (contrib) — Loki-first router with durable MSK (Kafka) failover.
+#
+# One Collector runs two roles at once:
+#
+#   Role A (live):   Alloy producers ──OTLP──▶ failover connector ──▶ Loki            (priority 1)
+#                                                                └─▶ MSK loki-logs   (priority 2, only while Loki is down)
+#   Role B (drain):  MSK loki-logs ──▶ Loki    (replays the buffered backlog once Loki is back)
+#
+# During a Loki outage the live path writes to Kafka. The drain path cannot push to
+# Loki either, so (at-least-once offset marking) it does not commit its offset and
+# Kafka keeps the data. When Loki recovers, the live path fails back AND the drain
+# path catches up — no gap, no data loss.
+#
+# The failover connector is alpha-stability and ships only in the contrib image.
+# Full explanation: docs/kafka-failover.md
+#
+# Apply:  kubectl apply -f otel-collector/otel-failover-collector.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-failover-collector
+  namespace: loki
+  annotations:
+    # IRSA role with MSK produce + consume permissions (iam/msk-access-policy.json).
+    # Its trust policy must allow: system:serviceaccount:loki:otel-failover-collector
+    eks.amazonaws.com/role-arn: arn:aws:iam::<AWS_ACCOUNT_ID>:role/<LOKI_KAFKA_ROLE_NAME>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-failover-collector
+  namespace: loki
+data:
+  config.yaml: |
+    receivers:
+      # Role A: live logs from the Alloy producers.
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+      # Role B: consume the buffer. The consumer group stores the committed offset,
+      # so after a restart the drain resumes exactly where it left off.
+      kafka/drain:
+        brokers:
+          - <MSK_BROKER_1>:9098
+          - <MSK_BROKER_2>:9098
+        protocol_version: 2.6.0
+        group_id: loki-forward-consumer
+        tls:
+          insecure: false
+        auth:
+          sasl:
+            mechanism: AWS_MSK_IAM_OAUTHBEARER
+            aws_msk:
+              region: <AWS_REGION>
+        logs:
+          topic: loki-logs
+          encoding: otlp_proto
+        # At-least-once: commit the Kafka offset only AFTER Loki acks (after: true),
+        # and do not advance it on a failed push (on_error: false → redelivered).
+        # This is what makes the buffer actually survive a Loki outage.
+        message_marking:
+          after: true
+          on_error: false
+
+    connectors:
+      failover:
+        # Each entry is a PIPELINE name (not an exporter). Level 1 is tried first;
+        # traffic drops to level 2 only while level 1's pipeline is unhealthy.
+        priority_levels:
+          - [logs/loki]     # primary  → Loki
+          - [logs/kafka]    # fallback → MSK (only during a Loki outage)
+        # How often to re-probe Loki to fail back once it recovers.
+        retry_interval: 1m
+
+    exporters:
+      # LIVE path (Role A). Fail FAST so a Loki outage propagates an error to the
+      # failover connector instead of being absorbed here — otherwise the connector
+      # never sees a failure and never fails over to Kafka.
+      otlphttp/loki-live:
+        logs_endpoint: http://loki-gateway.loki.svc.cluster.local/otlp/v1/logs
+        retry_on_failure:
+          enabled: true
+          max_elapsed_time: 30s
+        sending_queue:
+          enabled: false
+
+      # DRAIN path (Role B). Opposite tuning: retry effectively forever and keep
+      # the queue off, so the kafka receiver's offset only advances after Loki
+      # truly acks. This makes the buffer durable across a long Loki outage.
+      otlphttp/loki-drain:
+        logs_endpoint: http://loki-gateway.loki.svc.cluster.local/otlp/v1/logs
+        retry_on_failure:
+          enabled: true
+          max_elapsed_time: 0s
+        sending_queue:
+          enabled: false
+
+      kafka/msk:
+        brokers:
+          - <MSK_BROKER_1>:9098
+          - <MSK_BROKER_2>:9098
+        protocol_version: 2.6.0
+        # MSK :9098 is SASL_SSL. TLS is top-level (moved out of auth in v0.124.0);
+        # empty/insecure:false = TLS on, trust the system CA pool (MSK public CA).
+        tls:
+          insecure: false
+        auth:
+          sasl:
+            mechanism: AWS_MSK_IAM_OAUTHBEARER
+            aws_msk:
+              region: <AWS_REGION>
+        logs:
+          topic: loki-logs
+          encoding: otlp_proto
+        producer:
+          # Wait for in-sync replicas before a record is considered written.
+          required_acks: -1
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        # Role A — live routing
+        logs/in:
+          receivers: [otlp]
+          exporters: [failover]
+        logs/loki:                 # failover priority 1 → Loki (fail fast)
+          receivers: [failover]
+          exporters: [otlphttp/loki-live]
+        logs/kafka:                # failover priority 2 → MSK
+          receivers: [failover]
+          exporters: [kafka/msk]
+        # Role B — drain/backfill the buffer
+        logs/drain:
+          receivers: [kafka/drain]
+          exporters: [otlphttp/loki-drain]
+      telemetry:
+        metrics:
+          # `address` was removed in recent Collector releases; bind the Prometheus
+          # pull endpoint to 0.0.0.0:8888 so it's scrapeable from outside the pod.
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: "0.0.0.0"
+                    port: 8888
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-failover-collector
+  namespace: loki
+  labels:
+    app: otel-failover-collector
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: otel-failover-collector
+  template:
+    metadata:
+      labels:
+        app: otel-failover-collector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8888"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: otel-failover-collector
+      containers:
+        - name: collector
+          # Pin to a current contrib release (schema here matches >= v0.124.0).
+          image: otel/opentelemetry-collector-contrib:0.128.0
+          args: ["--config=/etc/otelcol/config.yaml"]
+          ports:
+            - { name: otlp-grpc, containerPort: 4317 }
+            - { name: otlp-http, containerPort: 4318 }
+            - { name: metrics,   containerPort: 8888 }
+            - { name: health,    containerPort: 13133 }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol
+          livenessProbe:
+            httpGet: { path: /, port: 13133 }
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet: { path: /, port: 13133 }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+      volumes:
+        - name: config
+          configMap:
+            name: otel-failover-collector
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-failover-collector
+  namespace: loki
+  labels:
+    app: otel-failover-collector
+spec:
+  selector:
+    app: otel-failover-collector
+  ports:
+    - { name: otlp-grpc, port: 4317, targetPort: 4317 }
+    - { name: otlp-http, port: 4318, targetPort: 4318 }

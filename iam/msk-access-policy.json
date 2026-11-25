@@ -1,0 +1,32 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Connect",
+      "Effect": "Allow",
+      "Action": [
+        "kafka-cluster:Connect",
+        "kafka-cluster:DescribeCluster",
+        "kafka-cluster:WriteDataIdempotently"
+      ],
+      "Resource": "arn:aws:kafka:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster/<MSK_CLUSTER_NAME>/*"
+    },
+    {
+      "Sid": "TopicReadWrite",
+      "Effect": "Allow",
+      "Action": [
+        "kafka-cluster:WriteData",
+        "kafka-cluster:ReadData",
+        "kafka-cluster:DescribeTopic",
+        "kafka-cluster:CreateTopic"
+      ],
+      "Resource": "arn:aws:kafka:<AWS_REGION>:<AWS_ACCOUNT_ID>:topic/<MSK_CLUSTER_NAME>/*/loki-logs"
+    },
+    {
+      "Sid": "GroupRead",
+      "Effect": "Allow",
+      "Action": ["kafka-cluster:AlterGroup", "kafka-cluster:DescribeGroup"],
+      "Resource": "arn:aws:kafka:<AWS_REGION>:<AWS_ACCOUNT_ID>:group/<MSK_CLUSTER_NAME>/*/loki-forward-consumer"
+    }
+  ]
+}

@@ -1,0 +1,127 @@
+# Grafana Alloy producer — "data-platform" (data-platform / MSK application logs)
+#
+# Flow: CloudWatch Logs -> Kinesis Firehose (HTTP endpoint) -> this Alloy (:9997)
+#       -> label -> convert to OTLP -> otel-failover-collector -> Loki (or Kafka if Loki is down)
+#
+# Install:
+#   helm upgrade --install alloy-data-platform grafana/alloy -n loki -f alloy/alloy-data-platform.yaml
+
+alloy:
+  extraPorts:
+    - name: firehose
+      port: 9997
+      targetPort: 9997
+      protocol: TCP
+
+  extraEnv:
+    - name: FIREHOSE_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: alloy-firehose-access-keys
+          key: data-platform
+
+  configMap:
+    content: |-
+      logging {
+        level  = "info"
+        format = "logfmt"
+      }
+
+      // ---------- 1. Receive from Kinesis Firehose ----------
+      loki.source.awsfirehose "firehose" {
+        http {
+          listen_address = "0.0.0.0"
+          listen_port    = 9997
+        }
+        access_key    = sys.env("FIREHOSE_ACCESS_KEY")
+        relabel_rules = loki.relabel.logging_origin.rules
+        forward_to    = [loki.process.label.receiver]
+      }
+
+      loki.relabel "logging_origin" {
+        rule {
+          action        = "replace"
+          source_labels = ["__aws_cw_log_group"]
+          target_label  = "log_group"
+        }
+        rule {
+          action        = "replace"
+          source_labels = ["__aws_cw_log_stream"]
+          target_label  = "log_stream"
+        }
+        forward_to = []
+      }
+
+      // ---------- 2. Label ----------
+      loki.process "label" {
+        forward_to = [
+          otelcol.receiver.loki.bridge.receiver,
+          loki.echo.debug.receiver,
+        ]
+
+        stage.static_labels {
+          values = {
+            app = "data-platform",
+            env = "dev",
+          }
+        }
+        stage.json {
+          expressions = { raw_log = "raw_log" }
+        }
+        // NOTE: raw_log is high-cardinality. After the OTLP hop it is stored as
+        // structured metadata, not an index label, so it is safe here.
+        stage.labels {
+          values = { raw_log = "raw_log" }
+        }
+      }
+
+      loki.echo "debug" { }
+
+      // ---------- 3. Convert to OTLP and stamp service identity ----------
+      otelcol.receiver.loki "bridge" {
+        output {
+          logs = [otelcol.processor.transform.identity.input]
+        }
+      }
+
+      otelcol.processor.transform "identity" {
+        error_mode = "ignore"
+        log_statements {
+          context = "resource"
+          statements = [
+            `set(attributes["service.name"], "data-platform")`,
+            `set(attributes["app"], "data-platform")`,
+            `set(attributes["env"], "dev")`,
+          ]
+        }
+        output {
+          logs = [otelcol.processor.batch.default.input]
+        }
+      }
+
+      otelcol.processor.batch "default" {
+        send_batch_size = 1024
+        timeout         = "1s"
+        output {
+          logs = [otelcol.exporter.otlp.failover_hub.input]
+        }
+      }
+
+      // ---------- 4. Ship to the central failover collector ----------
+      otelcol.exporter.otlp "failover_hub" {
+        client {
+          endpoint = "otel-failover-collector.loki.svc.cluster.local:4317"
+          tls {
+            insecure = true
+          }
+        }
+      }
+
+serviceAccount:
+  create: true
+  name: alloy-data-platform
+
+service:
+  enabled: true
+  type: NodePort
+  nodePort: 31125

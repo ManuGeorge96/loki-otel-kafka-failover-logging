@@ -1,0 +1,227 @@
+# LEGACY — the original single-binary Loki (v2.2) this project replaced.
+# Kept only to document the migration. Do NOT deploy alongside loki/values.yaml.
+#
+# Limitations that drove the migration:
+#   - 1 replica StatefulSet: no HA, every restart = ingestion outage
+#   - boltdb + filesystem storage on an EFS volume: slow, size-capped, hard to scale
+#   - schema v11, no structured metadata, no native OTLP ingest
+#
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: loki
+  namespace: monitoring
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: loki
+  name: loki
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki
+  serviceName: loki-headless
+  template:
+    metadata:
+      annotations:
+        prometheus.io/port: http-metrics
+        prometheus.io/scrape: "true"
+      labels:
+        app: loki
+        name: loki
+    spec:
+      nodeSelector:
+        node: devops-tools
+      tolerations:
+        - key: node
+          operator: Equal
+          value: devops-tools
+      containers:
+        - args:
+            - -config.file=/etc/loki/loki.yaml
+          image: grafana/loki:2.2.0
+          imagePullPolicy: Always
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /ready
+              port: http-metrics
+              scheme: HTTP
+            initialDelaySeconds: 45
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          name: loki
+          ports:
+            - containerPort: 3100
+              name: http-metrics
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /ready
+              port: http-metrics
+              scheme: HTTP
+            initialDelaySeconds: 45
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          securityContext:
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /etc/loki
+              name: config
+            - mountPath: /data
+              name: loki-storage-volume
+      securityContext:
+        runAsGroup: 0
+        runAsUser: 0
+      serviceAccount: loki
+      serviceAccountName: loki
+      volumes:
+        - name: config
+          configMap:
+            name: loki-config
+        - name: loki-storage-volume
+          persistentVolumeClaim:
+            claimName: loki-efs-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: loki-efs-pvc
+  namespace: monitoring
+  annotations:
+    volume.beta.kubernetes.io/storage-provisioner: aws-efs-provisioner
+  finalizers:
+    - kubernetes.io/pvc-protection
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: aws-efs
+  volumeMode: Filesystem
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: loki
+  name: loki
+  namespace: monitoring
+spec:
+  ports:
+    - name: http-metrics
+      port: 3100
+      protocol: TCP
+      targetPort: http-metrics
+  selector:
+    app: loki
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: loki
+  name: loki-headless
+  namespace: monitoring
+spec:
+  clusterIP: None
+  ports:
+    - name: http-metrics
+      port: 3100
+      protocol: TCP
+      targetPort: http-metrics
+  selector:
+    app: loki
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  labels:
+    name: loki-config
+  namespace: monitoring
+data:
+  loki.yaml: |-
+    auth_enabled: false
+    server:
+      http_listen_port: 3100
+    ingester:
+      lifecycler:
+        address: 127.0.0.1
+        ring:
+          kvstore:
+            store: inmemory
+          replication_factor: 1
+        final_sleep: 0s
+      chunk_idle_period: 5m
+      chunk_retain_period: 30s
+    schema_config:
+      configs:
+      - from: 2020-05-15
+        store: boltdb
+        object_store: filesystem
+        schema: v11
+        index:
+          prefix: index_
+          period: 720h
+    storage_config:
+      boltdb:
+        directory: /data/loki/index
+      filesystem:
+        directory: /data/loki/chunks
+    limits_config:
+      max_entries_limit_per_query: 100000
+      enforce_metric_name: false
+      reject_old_samples: true
+      reject_old_samples_max_age: 720h
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: loki
+  namespace: monitoring
+  labels:
+    app: loki
+  annotations:
+    alb.ingress.kubernetes.io/actions.ssl-redirect:
+      '{ "Type": "redirect", "RedirectConfig":
+      { "Protocol": "HTTPS", "Port": "443", "StatusCode": "HTTP_301" } }'
+    alb.ingress.kubernetes.io/healthcheck-path: /ready
+    alb.ingress.kubernetes.io/listen-ports: '[{ "HTTP": 80 }, { "HTTPS": 443 }]'
+    alb.ingress.kubernetes.io/certificate-arn: "<ACM_CERTIFICATE_ARN>"
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/load-balancer-name: loki-build
+    alb.ingress.kubernetes.io/tags: Name=loki
+    alb.ingress.kubernetes.io/subnets: "<PRIVATE_SUBNET_ID_1>,<PRIVATE_SUBNET_ID_2>"
+    alb.ingress.kubernetes.io/target-type: "ip"
+spec:
+  ingressClassName: alb
+  rules:
+    - host: loki.<YOUR_DOMAIN>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ssl-redirect
+                port:
+                  name: use-annotation
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: loki
+                port:
+                  number: 3100

@@ -1,0 +1,209 @@
+# Grafana Alloy producer — "api-v3" (AWS API Gateway access + execution logs)
+#
+# Flow: CloudWatch Logs -> Kinesis Firehose (HTTP endpoint) -> this Alloy (:9999)
+#       -> parse/label -> convert to OTLP -> otel-failover-collector -> Loki (or Kafka if Loki is down)
+#
+# Install:
+#   helm upgrade --install alloy-api-v3 grafana/alloy -n loki -f alloy/alloy-api-v3.yaml
+
+alloy:
+  extraPorts:
+    - name: firehose
+      port: 9999
+      targetPort: 9999
+      protocol: TCP
+
+  # Firehose shared secret comes from a Kubernetes Secret — never hard-code it.
+  extraEnv:
+    - name: FIREHOSE_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: alloy-firehose-access-keys
+          key: api-v3
+
+  configMap:
+    content: |-
+      logging {
+        level  = "info"
+        format = "logfmt"
+      }
+
+      // ---------- 1. Receive from Kinesis Firehose ----------
+      loki.source.awsfirehose "firehose" {
+        http {
+          listen_address = "0.0.0.0"
+          listen_port    = 9999
+        }
+        access_key    = sys.env("FIREHOSE_ACCESS_KEY")
+        relabel_rules = loki.relabel.logging_origin.rules
+        forward_to    = [loki.process.api_logs.receiver]
+      }
+
+      // Keep the CloudWatch log group / stream as labels
+      loki.relabel "logging_origin" {
+        rule {
+          action        = "replace"
+          source_labels = ["__aws_cw_log_group"]
+          target_label  = "log_group"
+        }
+        rule {
+          action        = "replace"
+          source_labels = ["__aws_cw_log_stream"]
+          target_label  = "log_stream"
+        }
+        forward_to = []
+      }
+
+      // ---------- 2. Parse API Gateway logs ----------
+      // Three shapes of log line are handled:
+      //   access logs   -> JSON with apiName / requestStatus / method ...
+      //   request logs  -> "Method request body before transformations: {...}"
+      //   response logs -> "Endpoint response body before transformations: {...}"
+      loki.process "api_logs" {
+        forward_to = [
+          otelcol.receiver.loki.bridge.receiver,
+          loki.echo.debug.receiver,
+        ]
+
+        // Request ID from execution logs: "(<uuid>)"
+        stage.regex {
+          expression = "\\((?P<exec_request_id>[a-f0-9-]{36})\\)"
+        }
+        stage.regex {
+          expression = "Method request body before transformations:\\s*(?P<request_body>\\{[\\s\\S]*?\\})"
+        }
+        stage.regex {
+          expression = "Endpoint response body before transformations:\\s*(?P<response_body>\\{[\\s\\S]*?\\})"
+        }
+
+        // Access logs (neither request nor response body matched)
+        stage.match {
+          selector = "{request_body=\"\", response_body=\"\"}"
+
+          stage.json {
+            expressions = {
+              apiName          = "apiName",
+              apigw_request_id = "request.apigw_request_id",
+              method           = "request.method",
+              path             = "request.path",
+              requestStatus    = "requestStatus",
+              sourceIp         = "identity.sourceIp",
+            }
+          }
+          stage.static_labels {
+            values = { log_type = "access" }
+          }
+          stage.labels {
+            values = {
+              apigName = "apiName",
+              method   = "method",
+              status   = "requestStatus",
+            }
+          }
+        }
+
+        // Request execution logs -> keep only the JSON body as the log line
+        stage.match {
+          selector = "{request_body!=\"\"}"
+
+          stage.output {
+            source = "request_body"
+          }
+          stage.static_labels {
+            values = { log_type = "request" }
+          }
+          stage.labels {
+            values = { request_id = "exec_request_id" }
+          }
+        }
+
+        // Response execution logs -> unwrap body.data and keep the status code
+        stage.match {
+          selector = "{response_body!=\"\"}"
+
+          stage.output {
+            source = "response_body"
+          }
+          stage.json {
+            expressions = {
+              statusCode = "statusCode",
+              body_str   = "body",
+            }
+          }
+          stage.json {
+            source      = "body_str"
+            expressions = { data = "data" }
+          }
+          stage.output {
+            source = "data"
+          }
+          stage.static_labels {
+            values = { log_type = "response" }
+          }
+          stage.labels {
+            values = {
+              request_id  = "exec_request_id",
+              status_code = "statusCode",
+            }
+          }
+        }
+
+        stage.static_labels {
+          values = {
+            app = "api-v3",
+            env = "dev",
+          }
+        }
+      }
+
+      loki.echo "debug" { }
+
+      // ---------- 3. Convert to OTLP and stamp service identity ----------
+      otelcol.receiver.loki "bridge" {
+        output {
+          logs = [otelcol.processor.transform.identity.input]
+        }
+      }
+
+      // These resource attributes become Loki INDEX labels (see loki/values.yaml otlp_config)
+      otelcol.processor.transform "identity" {
+        error_mode = "ignore"
+        log_statements {
+          context = "resource"
+          statements = [
+            `set(attributes["service.name"], "api-v3")`,
+            `set(attributes["app"], "api-v3")`,
+            `set(attributes["env"], "dev")`,
+          ]
+        }
+        output {
+          logs = [otelcol.processor.batch.default.input]
+        }
+      }
+
+      otelcol.processor.batch "default" {
+        send_batch_size = 1024
+        timeout         = "1s"
+        output {
+          logs = [otelcol.exporter.otlp.failover_hub.input]
+        }
+      }
+
+      // ---------- 4. Ship to the central failover collector (in-cluster gRPC) ----------
+      otelcol.exporter.otlp "failover_hub" {
+        client {
+          endpoint = "otel-failover-collector.loki.svc.cluster.local:4317"
+          tls {
+            insecure = true
+          }
+        }
+      }
+
+serviceAccount:
+  create: true
+  name: alloy-api-v3
+
+service:
+  enabled: true
+  type: NodePort
+  nodePort: 31129
