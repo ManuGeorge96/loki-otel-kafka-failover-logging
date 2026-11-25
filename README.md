@@ -1,0 +1,1 @@
+# loki-otel-kafka-failover-logging
